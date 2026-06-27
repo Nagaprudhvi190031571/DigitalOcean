@@ -1,0 +1,25 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: llm-shadow-proxy
+
+llm:
+  proxy:
+    primary-url: http://localhost:8080/mock/primary/v1/chat/completions
+    candidate-url: http://localhost:8080/mock/candidate/v1/chat/completions
+    shadow-enabled: true
+    connect-timeout: 5s
+    read-timeout: 30s
+    shadow-read-timeout: 120s
+
+logging:
+  level:
+    com.example.shadowproxy.service.ShadowComparisonService: INFO
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

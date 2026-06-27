@@ -1,0 +1,12 @@
+server:
+  port: 8080
+
+llm:
+  primary:
+    url: http://localhost:${server.port}/mock/primary/completions
+  candidate:
+    url: http://localhost:${server.port}/mock/candidate/completions
+
+logging:
+  level:
+    com.proxy.llm.service.ComparisonService: INFO
