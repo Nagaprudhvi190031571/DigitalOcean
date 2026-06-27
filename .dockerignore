@@ -1,0 +1,9 @@
+target/
+.git/
+.github/
+.idea/
+.vscode/
+*.iml
+*.log
+llm-shadow-proxy/target/
+llm-shadow-proxy/.mvn/wrapper/maven-wrapper.jar
