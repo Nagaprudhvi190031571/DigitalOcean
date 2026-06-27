@@ -17,8 +17,6 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
-import java.util.Map;
-
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.post;
 import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
@@ -35,7 +33,7 @@ class ShadowIsolationIntegrationTest {
 
     private static final String PRIMARY_BODY =
             """
-            {"id":"primary-1","model":"primary-v1","content":"primary-ok","latencyMs":0}
+            {"id":"primary-1","object":"chat.completion","model":"primary-v1","choices":[{"message":{"content":"primary-ok"}}]}
             """;
 
     private static final WireMockServer primaryServer =
@@ -49,8 +47,8 @@ class ShadowIsolationIntegrationTest {
 
     @DynamicPropertySource
     static void registerLlmEndpoints(DynamicPropertyRegistry registry) {
-        registry.add("llm.primary.url", () -> primaryServer.baseUrl() + "/completions");
-        registry.add("llm.candidate.url", () -> candidateServer.baseUrl() + "/completions");
+        registry.add("llm.primary.url", () -> primaryServer.baseUrl() + "/v1/chat/completions");
+        registry.add("llm.candidate.url", () -> candidateServer.baseUrl() + "/v1/chat/completions");
     }
 
     @BeforeAll
@@ -70,7 +68,7 @@ class ShadowIsolationIntegrationTest {
         primaryServer.resetAll();
         candidateServer.resetAll();
 
-        primaryServer.stubFor(post(urlEqualTo("/completions"))
+        primaryServer.stubFor(post(urlEqualTo("/v1/chat/completions"))
                 .willReturn(aResponse()
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
@@ -79,47 +77,44 @@ class ShadowIsolationIntegrationTest {
 
     @Test
     void primaryReturnsBeforeSlowCandidateCompletes() {
-        candidateServer.stubFor(post(urlEqualTo("/completions"))
+        candidateServer.stubFor(post(urlEqualTo("/v1/chat/completions"))
                 .willReturn(aResponse()
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
                         .withFixedDelay(5_000)
                         .withBody(
                                 """
-                                {"id":"candidate-1","model":"candidate-v2","content":"late","latencyMs":0}
+                                {"id":"candidate-1","object":"chat.completion","model":"candidate-v2","choices":[{"message":{"content":"late"}}]}
                                 """)));
 
         long startMs = System.currentTimeMillis();
-        ResponseEntity<Map> response = restTemplate.postForEntity(
-                "/v1/completions",
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/v1/chat/completions",
                 requestEntity("latency probe"),
-                Map.class
+                String.class
         );
         long elapsedMs = System.currentTimeMillis() - startMs;
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(elapsedMs).isLessThan(2_000);
-        assertThat(response.getBody())
-                .containsEntry("content", "primary-ok")
-                .containsEntry("model", "primary-v1");
+        assertThat(response.getBody()).contains("primary-ok");
 
-        primaryServer.verify(postRequestedFor(urlEqualTo("/completions")));
-        // Shadow is fire-and-forget; candidate may still be in-flight after client response.
+        primaryServer.verify(postRequestedFor(urlEqualTo("/v1/chat/completions")));
     }
 
     @Test
     void primarySucceedsWhenCandidateReturnsServerError() {
-        candidateServer.stubFor(post(urlEqualTo("/completions"))
+        candidateServer.stubFor(post(urlEqualTo("/v1/chat/completions"))
                 .willReturn(aResponse().withStatus(500).withBody("candidate unavailable")));
 
-        ResponseEntity<Map> response = restTemplate.postForEntity(
-                "/v1/completions",
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                "/v1/chat/completions",
                 requestEntity("failure probe"),
-                Map.class
+                String.class
         );
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(response.getBody()).containsEntry("content", "primary-ok");
+        assertThat(response.getBody()).contains("primary-ok");
     }
 
     @Test
@@ -127,18 +122,25 @@ class ShadowIsolationIntegrationTest {
         candidateServer.stop();
 
         try {
-            ResponseEntity<Map> response = restTemplate.postForEntity(
-                    "/v1/completions",
+            ResponseEntity<String> response = restTemplate.postForEntity(
+                    "/v1/chat/completions",
                     requestEntity("connection failure probe"),
-                    Map.class
+                    String.class
             );
 
             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
-            assertThat(response.getBody()).containsEntry("content", "primary-ok");
+            assertThat(response.getBody()).contains("primary-ok");
         } finally {
             candidateServer.start();
             WireMock.configureFor("localhost", candidateServer.port());
         }
+    }
+
+    @Test
+    void healthEndpointIsAvailable() {
+        ResponseEntity<String> response = restTemplate.getForEntity("/actuator/health", String.class);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).contains("\"status\":\"UP\"");
     }
 
     private HttpEntity<String> requestEntity(String prompt) {
@@ -146,7 +148,7 @@ class ShadowIsolationIntegrationTest {
         headers.setContentType(MediaType.APPLICATION_JSON);
         return new HttpEntity<>(
                 """
-                {"prompt":"%s"}
+                {"messages":[{"role":"user","content":"%s"}]}
                 """.formatted(prompt),
                 headers
         );

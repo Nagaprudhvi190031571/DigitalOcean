@@ -1,60 +1,96 @@
 package com.proxy.llm.service;
 
-import com.proxy.llm.dto.LlmResponse;
-import com.proxy.llm.dto.PromptRequest;
+import java.util.Objects;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.proxy.llm.model.ShadowRequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-
-import java.util.Objects;
 
 @Service
 public class ComparisonService {
 
     private static final Logger log = LoggerFactory.getLogger(ComparisonService.class);
+    private static final int LOG_TRUNCATE_LENGTH = 2_000;
 
-    public void compareAndLog(
-            PromptRequest request,
-            LlmResponse primary,
-            LlmResponse candidate,
-            String correlationId
-    ) {
-        boolean contentMatch = Objects.equals(
-                normalize(primary.content()),
-                normalize(candidate.content())
-        );
+    private final ObjectMapper objectMapper;
 
-        if (contentMatch) {
+    public ComparisonService(ObjectMapper objectMapper) {
+        this.objectMapper = objectMapper;
+    }
+
+    public boolean compareAndLog(ShadowRequestContext context, String candidateBody, int candidateStatusCode) {
+        if (responsesMatch(context.primaryResponseBody(), candidateBody)) {
             log.info(
-                    "Shadow match correlationId={} primaryModel={} candidateModel={} primaryLatencyMs={} candidateLatencyMs={}",
-                    correlationId,
-                    primary.model(),
-                    candidate.model(),
-                    primary.latencyMs(),
-                    candidate.latencyMs()
+                    "Shadow match requestId={} path={} primaryStatus={} candidateStatus={}",
+                    context.requestId(),
+                    context.path(),
+                    context.primaryStatusCode(),
+                    candidateStatusCode
             );
-            return;
+            return true;
         }
 
         log.warn(
                 """
-                Shadow MISMATCH correlationId={}
-                  prompt: {}
-                  primary  [model={}, latencyMs={}]: {}
-                  candidate[model={}, latencyMs={}]: {}
+                Shadow MISMATCH requestId={} path={} primaryStatus={} candidateStatus={}
+                primaryResponse={}
+                candidateResponse={}
                 """,
-                correlationId,
-                request.prompt(),
-                primary.model(),
-                primary.latencyMs(),
-                primary.content(),
-                candidate.model(),
-                candidate.latencyMs(),
-                candidate.content()
+                context.requestId(),
+                context.path(),
+                context.primaryStatusCode(),
+                candidateStatusCode,
+                truncate(context.primaryResponseBody()),
+                truncate(candidateBody)
         );
+        return false;
     }
 
-    private String normalize(String content) {
-        return content == null ? "" : content.strip();
+    boolean responsesMatch(String primaryBody, String candidateBody) {
+        if (Objects.equals(primaryBody, candidateBody)) {
+            return true;
+        }
+
+        try {
+            JsonNode primaryJson = objectMapper.readTree(primaryBody);
+            JsonNode candidateJson = objectMapper.readTree(candidateBody);
+
+            if (primaryJson.equals(candidateJson)) {
+                return true;
+            }
+
+            String primaryContent = extractAssistantContent(primaryJson);
+            String candidateContent = extractAssistantContent(candidateJson);
+            return primaryContent != null
+                    && candidateContent != null
+                    && Objects.equals(primaryContent, candidateContent);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private static String extractAssistantContent(JsonNode root) {
+        JsonNode choices = root.path("choices");
+        if (!choices.isArray() || choices.isEmpty()) {
+            return null;
+        }
+        JsonNode content = choices.get(0).path("message").path("content");
+        if (content.isTextual()) {
+            return content.asText();
+        }
+        JsonNode legacyContent = choices.get(0).path("text");
+        return legacyContent.isTextual() ? legacyContent.asText() : null;
+    }
+
+    private static String truncate(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.length() <= LOG_TRUNCATE_LENGTH
+                ? value
+                : value.substring(0, LOG_TRUNCATE_LENGTH) + "...[truncated]";
     }
 }

@@ -1,33 +1,45 @@
 package com.proxy.llm.service;
 
 import com.proxy.llm.config.AsyncConfig;
-import com.proxy.llm.dto.LlmResponse;
-import com.proxy.llm.dto.PromptRequest;
+import com.proxy.llm.config.LlmProperties;
+import com.proxy.llm.model.LlmForwardResponse;
+import com.proxy.llm.model.ShadowRequestContext;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
-import org.springframework.beans.factory.annotation.Value;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.http.MediaType;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
 
 @Service
 public class ShadowService {
 
     private static final Logger log = LoggerFactory.getLogger(ShadowService.class);
 
-    private final RestClient restClient;
+    private final LlmProperties properties;
+    private final RestClient shadowRestClient;
     private final ComparisonService comparisonService;
-    private final String candidateUrl;
+    private final Counter shadowMatchCounter;
+    private final Counter shadowMismatchCounter;
+    private final Counter shadowFailureCounter;
 
     public ShadowService(
-            RestClient restClient,
+            LlmProperties properties,
+            @Qualifier("shadowRestClient") RestClient shadowRestClient,
             ComparisonService comparisonService,
-            @Value("${llm.candidate.url}") String candidateUrl
+            MeterRegistry meterRegistry
     ) {
-        this.restClient = restClient;
+        this.properties = properties;
+        this.shadowRestClient = shadowRestClient;
         this.comparisonService = comparisonService;
-        this.candidateUrl = candidateUrl;
+        this.shadowMatchCounter = meterRegistry.counter("llm.shadow.comparison", "result", "match");
+        this.shadowMismatchCounter = meterRegistry.counter("llm.shadow.comparison", "result", "mismatch");
+        this.shadowFailureCounter = meterRegistry.counter("llm.shadow.comparison", "result", "failure");
     }
 
     /**
@@ -35,31 +47,61 @@ public class ShadowService {
      * and the primary HTTP response lifecycle.
      */
     @Async(AsyncConfig.SHADOW_EXECUTOR)
-    public void executeShadow(PromptRequest request, LlmResponse primaryResponse, String correlationId) {
-        MDC.put("correlationId", correlationId);
+    public void executeShadow(ShadowRequestContext context) {
+        MDC.put("requestId", context.requestId());
+        long startedAt = System.currentTimeMillis();
         try {
-            log.debug("Shadow request started for correlationId={}", correlationId);
+            log.debug("Shadow request started requestId={} path={}", context.requestId(), context.path());
 
-            long start = System.currentTimeMillis();
-            LlmResponse candidateResponse = restClient.post()
-                    .uri(candidateUrl)
-                    .body(request)
-                    .retrieve()
-                    .body(LlmResponse.class);
+            LlmForwardResponse candidateResponse = forwardToCandidate(context);
+            long durationMs = System.currentTimeMillis() - startedAt;
 
-            long latencyMs = System.currentTimeMillis() - start;
-            LlmResponse candidateWithLatency = new LlmResponse(
-                    candidateResponse.id(),
-                    candidateResponse.model(),
-                    candidateResponse.content(),
-                    latencyMs
+            if (comparisonService.compareAndLog(context, candidateResponse.body(), candidateResponse.statusCode())) {
+                shadowMatchCounter.increment();
+            } else {
+                shadowMismatchCounter.increment();
+            }
+
+            log.debug(
+                    "Shadow request finished requestId={} path={} durationMs={}",
+                    context.requestId(),
+                    context.path(),
+                    durationMs
             );
-
-            comparisonService.compareAndLog(request, primaryResponse, candidateWithLatency, correlationId);
         } catch (Exception ex) {
-            log.warn("Shadow request failed for correlationId={}: {}", correlationId, ex.getMessage());
+            shadowFailureCounter.increment();
+            log.warn(
+                    "Shadow request failed requestId={} path={} durationMs={} error={}",
+                    context.requestId(),
+                    context.path(),
+                    System.currentTimeMillis() - startedAt,
+                    ex.toString()
+            );
         } finally {
-            MDC.remove("correlationId");
+            MDC.remove("requestId");
+        }
+    }
+
+    private LlmForwardResponse forwardToCandidate(ShadowRequestContext context) {
+        try {
+            RestClient.RequestBodySpec spec = shadowRestClient.post().uri(properties.candidate().url());
+            context.forwardHeaders().forEach(spec::header);
+
+            return spec.contentType(MediaType.APPLICATION_JSON)
+                    .body(context.requestBody())
+                    .exchange((request, response) -> new LlmForwardResponse(
+                            response.getStatusCode().value(),
+                            new String(response.getBody().readAllBytes()),
+                            response.getHeaders().getContentType() != null
+                                    ? response.getHeaders().getContentType().toString()
+                                    : MediaType.APPLICATION_JSON_VALUE));
+        } catch (RestClientResponseException ex) {
+            return new LlmForwardResponse(
+                    ex.getStatusCode().value(),
+                    ex.getResponseBodyAsString(),
+                    ex.getResponseHeaders() != null && ex.getResponseHeaders().getContentType() != null
+                            ? ex.getResponseHeaders().getContentType().toString()
+                            : MediaType.APPLICATION_JSON_VALUE);
         }
     }
 }
