@@ -1,0 +1,37 @@
+# DigitalOcean App Platform spec for llm-proxy
+# Deploy: doctl auth init && doctl apps create --spec .do/app.yaml
+# Update:  doctl apps update <APP_ID> --spec .do/app.yaml
+name: llm-proxy
+region: nyc
+
+services:
+  - name: llm-proxy
+    github:
+      repo: Nagaprudhvi190031571/DigitalOcean
+      branch: main
+      deploy_on_push: true
+    dockerfile_path: Dockerfile
+    http_port: 8080
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    health_check:
+      initial_delay_seconds: 45
+      period_seconds: 30
+      timeout_seconds: 5
+      success_threshold: 1
+      failure_threshold: 3
+      http_path: /actuator/health/liveness
+    envs:
+      - key: LLM_SHADOW_ENABLED
+        value: "true"
+        scope: RUN_TIME
+        type: GENERAL
+      # Uncomment and set via DO console or `doctl apps update` for real upstreams:
+      # - key: LLM_PRIMARY_URL
+      #   value: "https://api.openai.com/v1/chat/completions"
+      #   scope: RUN_TIME
+      #   type: SECRET
+      # - key: LLM_CANDIDATE_URL
+      #   value: "https://api.openai.com/v1/chat/completions"
+      #   scope: RUN_TIME
+      #   type: SECRET
